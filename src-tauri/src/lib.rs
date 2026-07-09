@@ -332,6 +332,21 @@ pub async fn run() {
           }
         }
 
+        // Close extension standalone windows when the main window is closed,
+        // so they don't keep the launcher process alive after the user closes the main window.
+        if let Some(main_window) = app.get_webview_window("main") {
+          let app_handle = app.handle().clone();
+          main_window.on_window_event(move |event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+              for (label, window) in app_handle.webview_windows() {
+                if label.starts_with("extension_standalone_") {
+                  let _ = window.close();
+                }
+              }
+            }
+          });
+        }
+
         // Registering the deep links at runtime on Linux and Windows
         // ref: https://v2.tauri.app/plugin/deep-linking/#registering-desktop-deep-links-at-runtime
         #[cfg(any(target_os = "linux", target_os = "windows"))]
