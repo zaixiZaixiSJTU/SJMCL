@@ -471,6 +471,14 @@ pub async fn generate_launch_command(
     cmd.extend(replace_arguments(client_jvm_args, &jvm_map));
   }
 
+  // additional JVM arguments required by patches, e.g. MultiMC `+jvmArgs`
+  if !client_info.extra_jvm_arguments.is_empty() {
+    cmd.extend(replace_arguments(
+      client_info.extra_jvm_arguments.clone(),
+      &jvm_map,
+    ));
+  }
+
   // main class (after replace jvm args)
   cmd.push(
     client_info

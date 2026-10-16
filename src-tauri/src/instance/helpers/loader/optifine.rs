@@ -275,6 +275,7 @@ async fn run_optifine_patcher(
       .as_ref()
       .ok_or(InstanceError::ProcessorExecutionFailed)?
       .major_version,
+    &client_info.compatible_java_majors,
   )
   .await?;
 
