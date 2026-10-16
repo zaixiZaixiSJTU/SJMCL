@@ -172,28 +172,32 @@ async fn refresh_instance(
     if let Err(e) = {
       match cfg_read.mod_loader.status {
         ModLoaderStatus::NotDownloaded => {
-          match cfg_read.mod_loader.loader_type {
+          let downloaded = match cfg_read.mod_loader.loader_type {
             ModLoaderType::Forge => {
               cfg_read.mod_loader.status = ModLoaderStatus::Downloading;
-              download_forge_libraries(app, &priority_list, &cfg_read, &mut client_data).await?;
+              download_forge_libraries(app, &priority_list, &cfg_read, &mut client_data).await
             }
             ModLoaderType::Cleanroom => {
               cfg_read.mod_loader.status = ModLoaderStatus::Downloading;
-              download_cleanroom_libraries(app, &priority_list, &cfg_read, &mut client_data)
-                .await?;
+              download_cleanroom_libraries(app, &priority_list, &cfg_read, &mut client_data).await
             }
             ModLoaderType::NeoForge => {
               cfg_read.mod_loader.status = ModLoaderStatus::Downloading;
-              download_neoforge_libraries(app, &priority_list, &cfg_read, &mut client_data).await?;
+              download_neoforge_libraries(app, &priority_list, &cfg_read, &mut client_data).await
             }
-            _ => {}
-          }
-          let vjson_path = cfg_read
-            .version_path
-            .join(format!("{}.json", cfg_read.name));
-          fs::write(vjson_path, serde_json::to_vec_pretty(&client_data)?)?;
+            _ => Ok(()),
+          };
 
-          Ok(())
+          // The error is returned instead of being propagated, so that a failed download only
+          // marks the mod loader as failed instead of making the whole instance invalid.
+          downloaded.and_then(|_| {
+            let vjson_path = cfg_read
+              .version_path
+              .join(format!("{}.json", cfg_read.name));
+            fs::write(vjson_path, serde_json::to_vec_pretty(&client_data)?)?;
+
+            Ok(())
+          })
         }
         ModLoaderStatus::DownloadFailed => match cfg_read.mod_loader.loader_type {
           ModLoaderType::Forge => {
@@ -250,14 +254,18 @@ async fn refresh_instance(
         }
         ModLoaderStatus::NotDownloaded => {
           cfg_read.optifine.as_mut().unwrap().status = ModLoaderStatus::Downloading;
-          download_optifine_libraries(app, &priority_list, &cfg_read, &mut client_data).await?;
+          let downloaded =
+            download_optifine_libraries(app, &priority_list, &cfg_read, &mut client_data).await;
 
-          let vjson_path = cfg_read
-            .version_path
-            .join(format!("{}.json", cfg_read.name));
-          fs::write(vjson_path, serde_json::to_vec_pretty(&client_data)?)?;
+          // See the mod loader above: keep the instance even when the download failed.
+          downloaded.and_then(|_| {
+            let vjson_path = cfg_read
+              .version_path
+              .join(format!("{}.json", cfg_read.name));
+            fs::write(vjson_path, serde_json::to_vec_pretty(&client_data)?)?;
 
-          Ok(())
+            Ok(())
+          })
         }
         ModLoaderStatus::DownloadFailed => {
           cfg_read.optifine.as_mut().unwrap().status = ModLoaderStatus::Downloading;

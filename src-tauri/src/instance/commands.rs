@@ -36,7 +36,8 @@ use crate::instance::helpers::modpack::export::{
   validate_export_options,
 };
 use crate::instance::helpers::modpack::import::{
-  ModpackMetaInfo, extract_overrides, get_download_params,
+  ModpackLaunchInfo, ModpackMetaInfo, apply_launch_info_to_client_info, extract_local_libraries,
+  extract_overrides, get_download_params, get_modpack_launch_info,
 };
 use crate::instance::helpers::mods::common::{
   check_potential_incompatibility, compress_icon, discover_local_mod_paths, get_mod_info_from_dir,
@@ -1077,7 +1078,7 @@ pub async fn create_instance(
   });
 
   // Create instance config
-  let instance = Instance {
+  let mut instance = Instance {
     id: format!("{}:{}", directory.name, name.clone()),
     name: name.clone(),
     version: game.id.clone(),
@@ -1127,6 +1128,43 @@ pub async fn create_instance(
   vanilla_patch.priority = Some(0);
   version_info.patches.push(vanilla_patch);
 
+  // Launch information declared by the modpack itself, e.g. MultiMC component patches, must be
+  // applied before anything is installed, since it may replace the main class, the libraries,
+  // the JVM arguments or the Java requirement of this instance.
+  let modpack_file = match modpack_path.as_ref() {
+    Some(path) => Some(fs::File::open(path).map_err(|_| InstanceError::FileNotFoundError)?),
+    None => None,
+  };
+  let modpack_launch_info = match modpack_file.as_ref() {
+    Some(file) => get_modpack_launch_info(&app, file).await?,
+    None => ModpackLaunchInfo::default(),
+  };
+  if !modpack_launch_info.patches.is_empty() {
+    apply_launch_info_to_client_info(&mut version_info, &modpack_launch_info)?;
+  }
+  if modpack_launch_info.is_mod_loader_provided {
+    instance.mod_loader.status = ModLoaderStatus::Installed;
+  }
+  if modpack_launch_info.jvm_args.is_some() || modpack_launch_info.max_memory.is_some() {
+    // The modpack overrides JVM arguments and/or memory, so the instance needs its own
+    // game config instead of the global one.
+    let mut spec_game_config = get_global_game_config(&app);
+    if let Some(jvm_args) = &modpack_launch_info.jvm_args {
+      let existing_args = spec_game_config.advanced.jvm.args.trim();
+      spec_game_config.advanced.jvm.args = if existing_args.is_empty() {
+        jvm_args.clone()
+      } else {
+        format!("{} {}", existing_args, jvm_args)
+      };
+    }
+    if let Some(max_memory) = modpack_launch_info.max_memory {
+      spec_game_config.performance.auto_mem_allocation = false;
+      spec_game_config.performance.max_mem_allocation = max_memory;
+    }
+    instance.spec_game_config = Some(spec_game_config);
+    instance.use_spec_game_config = true;
+  }
+
   let mut task_params = Vec::<PTaskParam>::new();
 
   // auto download recommended java if needed
@@ -1137,11 +1175,28 @@ pub async fn create_instance(
       .as_ref()
       .map_or(0i32, |version| version.major_version);
 
-    if let Err(err) = select_java_runtime(&app, None, &instance, client_java_version).await
+    if let Err(err) = select_java_runtime(
+      &app,
+      None,
+      &instance,
+      client_java_version,
+      &version_info.compatible_java_majors,
+    )
+    .await
       && err.0 == LaunchError::NoSuitableJava.to_string()
     {
-      let minimum_java_version =
-        get_minimum_java_version_by_game(&app, &instance, client_java_version, false).await;
+      // When the modpack declares the exact set of Java versions it supports, download the
+      // smallest declared version instead of the one inferred from the game and mod loader.
+      let minimum_java_version = if version_info.compatible_java_majors.is_empty() {
+        get_minimum_java_version_by_game(&app, &instance, client_java_version, false).await
+      } else {
+        version_info
+          .compatible_java_majors
+          .iter()
+          .min()
+          .copied()
+          .unwrap_or(client_java_version)
+      };
       let minimum_java_version = minimum_java_version.to_string();
       task_params.extend(build_mojang_java_download_params(&app, &minimum_java_version).await?);
       java_version_to_download = Some(minimum_java_version);
@@ -1175,6 +1230,14 @@ pub async fn create_instance(
     return Err(InstanceError::InstanceNotFoundByID.into());
   };
 
+  // Libraries shipped inside the modpack archive cannot be downloaded, so they must be copied
+  // before the missing library files are collected.
+  if !modpack_launch_info.local_libraries.is_empty()
+    && let Some(file) = modpack_file.as_ref()
+  {
+    extract_local_libraries(file, libraries_dir, &modpack_launch_info.local_libraries)?;
+  }
+
   replace_native_libraries(&app, &mut version_info, &instance)
     .await
     .map_err(|_| InstanceError::ClientJsonParseError)?;
@@ -1195,8 +1258,10 @@ pub async fn create_instance(
     is_install_qf_api = Some(false);
   }
 
-  // download loader (installer)
-  if instance.mod_loader.loader_type != ModLoaderType::Unknown {
+  // download loader (installer), unless the modpack already defines the complete mod loader
+  if !modpack_launch_info.is_mod_loader_provided
+    && instance.mod_loader.loader_type != ModLoaderType::Unknown
+  {
     install_mod_loader(
       app.clone(),
       &priority_list,
@@ -1222,12 +1287,10 @@ pub async fn create_instance(
     .await?;
   }
 
-  // If modpack path is provided, install it
-  if let Some(modpack_path) = modpack_path {
-    let path = PathBuf::from(modpack_path);
-    let file = fs::File::open(&path).map_err(|_| InstanceError::FileNotFoundError)?;
-    task_params.extend(get_download_params(&app, &file, &version_path).await?);
-    extract_overrides(&file, &version_path)?;
+  // If modpack is provided, install its downloads and overrides
+  if let Some(file) = modpack_file.as_ref() {
+    task_params.extend(get_download_params(&app, file, &version_path).await?);
+    extract_overrides(file, &version_path)?;
   }
 
   schedule_progressive_task_group(

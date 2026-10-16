@@ -3,6 +3,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use semver::Version;
 use sjmcl_types::error::{SJMCLError, SJMCLResult};
 use sjmcl_types::storage::load_json_async;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
@@ -79,20 +80,44 @@ pub fn get_native_library_artifacts(client_info: &McClientInfo) -> Vec<Downloads
   artifacts.into_iter().collect()
 }
 
+/// Files that must be present in the Maven directory but that are not part of the classpath,
+/// e.g. the installer jar a modpack component's launch wrapper runs.
+pub fn get_maven_file_artifacts(client_info: &McClientInfo) -> Vec<DownloadsArtifact> {
+  let mut artifacts = HashSet::new();
+  for library in &client_info.maven_files {
+    if let Some(artifact) = library
+      .downloads
+      .as_ref()
+      .and_then(|downloads| downloads.artifact.as_ref())
+    {
+      artifacts.insert(artifact.clone());
+    }
+  }
+  artifacts.into_iter().collect()
+}
+
 pub async fn get_invalid_library_files(
   source: SourceType,
   library_path: &Path,
   client_info: &McClientInfo,
   check_hash: bool,
 ) -> SJMCLResult<Vec<PTaskParam>> {
-  let mut artifacts = Vec::new();
+  let mut artifacts = HashSet::new();
   artifacts.extend(get_native_library_artifacts(client_info));
   artifacts.extend(get_nonnative_library_artifacts(client_info));
+  artifacts.extend(get_maven_file_artifacts(client_info));
 
   let futs = artifacts.into_iter().map(move |artifact| async move {
     let file_path = library_path.join(&artifact.path);
     let exists = fs::try_exists(&file_path).await?;
-    if exists && (!check_hash || validate_sha1(file_path.clone(), artifact.sha1.clone()).is_ok()) {
+    // Libraries declared by a modpack may not carry a checksum, and an empty one means
+    // there is nothing to validate.
+    let has_sha1 = !artifact.sha1.is_empty();
+    if exists
+      && (!check_hash
+        || !has_sha1
+        || validate_sha1(file_path.clone(), artifact.sha1.clone()).is_ok())
+    {
       Ok(None)
     } else if artifact.url.is_empty() {
       Err(LaunchError::GameFilesIncomplete.into())
@@ -112,7 +137,7 @@ pub async fn get_invalid_library_files(
         src,
         dest: file_path,
         filename: None,
-        sha1: Some(artifact.sha1.clone()),
+        sha1: has_sha1.then(|| artifact.sha1.clone()),
       })))
     }
   });
@@ -284,6 +309,154 @@ pub fn merge_library_lists(
   }
 
   library_map.into_values().collect()
+}
+
+/// Insert a library into the library list of a client json, following Prism's
+/// `LaunchProfile::applyLibrary`: a library is looked up by its artifact (group, name,
+/// classifier and extension, without the version), and it replaces the applied library only
+/// when it declares a higher version. A replacement keeps the position of the applied library,
+/// so that the classpath order stays stable.
+pub fn apply_library(libraries: &mut Vec<LibrariesValue>, library: LibrariesValue) {
+  let Ok(new_parts) = parse_library_name(&library.name, None) else {
+    if !libraries.iter().any(|item| item.name == library.name) {
+      libraries.push(library);
+    }
+    return;
+  };
+
+  let applied_index = libraries.iter().position(|item| {
+    parse_library_name(&item.name, None).is_ok_and(|parts| {
+      parts.path == new_parts.path
+        && parts.pack_name == new_parts.pack_name
+        && parts.classifier == new_parts.classifier
+        && parts.extension == new_parts.extension
+    })
+  });
+
+  match applied_index {
+    Some(index) => {
+      let applied_version = parse_library_name(&libraries[index].name, None)
+        .map(|parts| parts.pack_version)
+        .unwrap_or_default();
+      if compare_library_versions(&new_parts.pack_version, &applied_version).is_gt() {
+        libraries[index] = library;
+      }
+    }
+    None => libraries.push(library),
+  }
+}
+
+/// Insert a library of the base game patch into the library list of a client json. Unlike a
+/// component library, it never replaces an applied library of the same artifact: the component
+/// definition wins, e.g. the patched log4j build a legacy modpack ships.
+pub fn apply_base_library(libraries: &mut Vec<LibrariesValue>, library: LibrariesValue) {
+  let Ok(parts) = parse_library_name(&library.name, None) else {
+    if !libraries.iter().any(|item| item.name == library.name) {
+      libraries.push(library);
+    }
+    return;
+  };
+
+  let applied = libraries.iter().any(|item| {
+    parse_library_name(&item.name, None).is_ok_and(|applied| {
+      applied.path == parts.path
+        && applied.pack_name == parts.pack_name
+        && applied.classifier == parts.classifier
+        && applied.extension == parts.extension
+    })
+  });
+  if !applied {
+    libraries.push(library);
+  }
+}
+
+/// Compare two library versions section by section, like Prism's `Version` does: a section of
+/// digits is compared numerically, any other section byte by byte. A version that already ended
+/// ranks above a pre-release section (`-...`) and below any other section.
+fn compare_library_versions(a: &str, b: &str) -> Ordering {
+  let a_sections = version_sections(a);
+  let b_sections = version_sections(b);
+
+  for index in 0..a_sections.len().max(b_sections.len()) {
+    let ordering = match (a_sections.get(index), b_sections.get(index)) {
+      (None, None) => Ordering::Equal,
+      // The left version ended here.
+      (None, Some(section)) => {
+        if section.starts_with('-') {
+          Ordering::Greater
+        } else {
+          Ordering::Less
+        }
+      }
+      // The right version ended here.
+      (Some(section), None) => {
+        if section.starts_with('-') {
+          Ordering::Less
+        } else {
+          Ordering::Greater
+        }
+      }
+      (Some(left), Some(right)) => compare_version_sections(left, right),
+    };
+    if ordering != Ordering::Equal {
+      return ordering;
+    }
+  }
+
+  Ordering::Equal
+}
+
+fn compare_version_sections(left: &str, right: &str) -> Ordering {
+  if left.chars().all(|character| character.is_ascii_digit())
+    && right.chars().all(|character| character.is_ascii_digit())
+  {
+    let left = left.trim_start_matches('0');
+    let right = right.trim_start_matches('0');
+    return left.len().cmp(&right.len()).then_with(|| left.cmp(right));
+  }
+
+  left
+    .chars()
+    .zip(right.chars())
+    .map(|(a, b)| a.cmp(&b))
+    .find(|ordering| *ordering != Ordering::Equal)
+    .unwrap_or_else(|| left.len().cmp(&right.len()))
+}
+
+/// Split a version into the compared sections, e.g. `2.9.4-nightly-20150209` is
+/// `["2", "9", "4", "-nightly", "-20150209"]`. Everything after `+` is ignored, like Prism does.
+fn version_sections(version: &str) -> Vec<String> {
+  let mut sections = Vec::new();
+  let mut current = String::new();
+  let mut is_digits = None;
+
+  for character in version.chars() {
+    if character == '+' {
+      break;
+    }
+    if character == '.' || character == '-' {
+      if !current.is_empty() {
+        sections.push(std::mem::take(&mut current));
+      }
+      // A dash marks the following section as a pre-release.
+      if character == '-' {
+        current.push(character);
+      }
+      is_digits = None;
+      continue;
+    }
+    let digits = character.is_ascii_digit();
+    if is_digits.is_some_and(|is_digits| is_digits != digits) {
+      sections.push(std::mem::take(&mut current));
+    }
+    is_digits = Some(digits);
+    current.push(character);
+  }
+  if !current.is_empty() {
+    sections.push(current);
+  }
+
+  sections
 }
 
 fn parse_sem_version(version: &str) -> Version {
@@ -578,4 +751,88 @@ pub async fn prepare_legacy_assets(
     .await?;
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn library(name: &str) -> LibrariesValue {
+    LibrariesValue {
+      name: name.to_string(),
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn apply_library_replaces_applied_artifacts_only_with_higher_versions() {
+    let mut libraries = vec![
+      library("org.lwjgl.lwjgl:lwjgl:2.9.1"),
+      library("org.lwjgl.lwjgl:lwjgl_util:2.9.1"),
+    ];
+
+    // A component of an old modpack may declare a higher version of a library that the game
+    // itself already applied, e.g. its LWJGL version. The position of the library is kept.
+    apply_library(
+      &mut libraries,
+      library("org.lwjgl.lwjgl:lwjgl:2.9.4-nightly-20150209"),
+    );
+    assert_eq!(
+      libraries
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>(),
+      [
+        "org.lwjgl.lwjgl:lwjgl:2.9.4-nightly-20150209",
+        "org.lwjgl.lwjgl:lwjgl_util:2.9.1"
+      ]
+    );
+
+    // A lower version never replaces an applied library.
+    apply_library(&mut libraries, library("org.lwjgl.lwjgl:lwjgl:2.9.1"));
+    assert_eq!(
+      libraries[0].name,
+      "org.lwjgl.lwjgl:lwjgl:2.9.4-nightly-20150209"
+    );
+
+    // A different classifier is a different artifact and is applied next to it.
+    apply_library(
+      &mut libraries,
+      library("org.lwjgl.lwjgl:lwjgl:2.9.1:natives-windows"),
+    );
+    assert_eq!(libraries.len(), 3);
+  }
+
+  #[test]
+  fn maven_files_are_downloaded_but_stay_off_the_classpath() {
+    let maven_file: LibrariesValue = serde_json::from_str(
+      r#"{
+        "name": "net.minecraftforge:forge:1.20.1-47.2.0:installer",
+        "downloads": {
+          "artifact": {
+            "path": "net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-installer.jar",
+            "url": "https://maven.minecraftforge.net/net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-installer.jar",
+            "sha1": "ded43dd1",
+            "size": 5973950
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+    let client_info = McClientInfo {
+      libraries: vec![LibrariesValue {
+        name: "org.lwjgl.lwjgl:lwjgl:2.9.1".to_string(),
+        ..Default::default()
+      }],
+      maven_files: vec![maven_file],
+      ..Default::default()
+    };
+
+    assert_eq!(get_maven_file_artifacts(&client_info).len(), 1);
+    assert!(
+      get_nonnative_library_artifacts(&client_info)
+        .iter()
+        .all(|artifact| !artifact.path.contains("installer"))
+    );
+  }
 }

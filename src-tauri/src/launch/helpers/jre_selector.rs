@@ -14,6 +14,9 @@ pub async fn select_java_runtime(
   game_java: Option<&GameJava>, // None means force auto selection for some installation flows.
   instance: &Instance,
   client_json_req: i32,
+  // The exact set of Java major versions this instance may run on, e.g. Prism's
+  // `compatibleJavaMajors`. Empty means the Java version is not constrained.
+  compatible_java_majors: &[i32],
   // TODO: pass client and mod loader info to calculate version with more rules, instead of passing require version
   // ref: https://github.com/Hex-Dragon/PCL2/blob/16e09c792ce8c13435fc6827e6da54170aaa3bc0/Plain%20Craft%20Launcher%202/Modules/Minecraft/ModLaunch.vb#L1130
 ) -> SJMCLResult<JavaInfo> {
@@ -25,6 +28,21 @@ pub async fn select_java_runtime(
       .find(|j| j.exec_path == game_java.exec_path)
       .cloned()
       .ok_or_else(|| LaunchError::SelectedJavaUnavailable.into());
+  }
+
+  // A declared java version set is a whitelist rather than a minimum requirement:
+  // e.g. `[17, 21]` means only Java 17 and Java 21 are acceptable.
+  if !compatible_java_majors.is_empty() {
+    let mut candidates = java_list
+      .iter()
+      .filter(|java| compatible_java_majors.contains(&java.major_version))
+      .cloned()
+      .collect::<Vec<_>>();
+    if candidates.is_empty() {
+      return Err(LaunchError::NoSuitableJava.into());
+    }
+    candidates.sort_by_key(|java| java.major_version);
+    return Ok(candidates[0].clone());
   }
 
   let min_version_req =

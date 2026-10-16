@@ -219,8 +219,8 @@ impl DownloadTask {
           Ok(())
         } else {
           match param.sha1 {
-            Some(truth) => validate_sha1(param.dest, truth),
-            None => Ok(()),
+            Some(truth) if !truth.is_empty() => validate_sha1(param.dest, truth),
+            _ => Ok(()),
           }
         }
       },
