@@ -6,13 +6,14 @@ use serde_with::{OneOrMany, serde_as};
 use sjmcl_macros::serialize_skip_none;
 use sjmcl_types::error::{SJMCLError, SJMCLResult};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::str::FromStr;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
 use crate::instance::models::misc::{Instance, ModLoaderType};
+use crate::launch::helpers::file_validator::{apply_base_library, apply_library};
 use crate::launcher_config::models::LauncherConfig;
 use crate::resource::models::OptiFineResourceInfo;
 use crate::utils::fs::get_app_resource_filepath;
@@ -45,6 +46,18 @@ pub struct McClientInfo {
   pub main_class: Option<String>,
   pub jar: Option<String>,
   pub client_version: Option<String>,
+
+  // Additional JVM arguments required by a patch, e.g. MultiMC `+jvmArgs`.
+  #[serde(skip_serializing_if = "Vec::is_empty", default)]
+  pub extra_jvm_arguments: Vec<String>,
+  // The exact set of Java major versions this instance may run on, e.g. Prism's
+  // `compatibleJavaMajors`. Empty means the version is not constrained.
+  #[serde(skip_serializing_if = "Vec::is_empty", default)]
+  pub compatible_java_majors: Vec<i32>,
+  // Files that belong in the Maven directory but not on the classpath, e.g. the installer jar
+  // a modpack component's launch wrapper runs.
+  #[serde(skip_serializing_if = "Vec::is_empty", default)]
+  pub maven_files: Vec<LibrariesValue>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -382,15 +395,54 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
     .iter()
     .any(|patch| matches!(patch.id.as_str(), "cleanroom" | "forge" | "legacyforge"));
 
+  // Libraries apply in patch order: a patch may declare a higher version of a library that an
+  // earlier patch already applied, e.g. the LWJGL version an old modpack ships as a component.
   client_info.libraries.clear();
-  let mut library_names = HashSet::new();
-  for patch in &patches {
+  let mut component_patches = patches.iter().skip(1).collect::<Vec<_>>();
+  component_patches.sort_by_key(|patch| patch.priority.unwrap_or(i64::MIN));
+  for patch in component_patches {
     for library in &patch.libraries {
-      if library_names.insert(library.name.clone()) {
-        client_info.libraries.push(library.clone());
+      apply_library(&mut client_info.libraries, library.clone());
+    }
+  }
+  // The base game patch only fills in the libraries no component has declared, so that a
+  // component definition is kept when both declare the same artifact, e.g. the patched log4j
+  // build of a legacy modpack (Prism only ever uses the component definitions).
+  for library in &base.libraries {
+    apply_base_library(&mut client_info.libraries, library.clone());
+  }
+
+  // Maven-only files accumulate over all patches as well; a file that two components need
+  // is only required once.
+  client_info.maven_files.clear();
+  for patch in &patches {
+    for maven_file in &patch.maven_files {
+      if !client_info
+        .maven_files
+        .iter()
+        .any(|item| item.name == maven_file.name)
+      {
+        client_info.maven_files.push(maven_file.clone());
       }
     }
   }
+
+  // Extra JVM arguments and compatible Java majors accumulate over all patches.
+  client_info.extra_jvm_arguments.clear();
+  client_info.compatible_java_majors.clear();
+  for patch in &patches {
+    for argument in &patch.extra_jvm_arguments {
+      if !client_info.extra_jvm_arguments.contains(argument) {
+        client_info.extra_jvm_arguments.push(argument.clone());
+      }
+    }
+    for major in &patch.compatible_java_majors {
+      if !client_info.compatible_java_majors.contains(major) {
+        client_info.compatible_java_majors.push(*major);
+      }
+    }
+  }
+  client_info.compatible_java_majors.sort_unstable();
 
   client_info.main_class = base.main_class.clone();
   client_info.arguments = base.arguments.clone();
@@ -408,6 +460,19 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
     .find(|arguments| !arguments.is_empty())
   {
     client_info.minecraft_arguments = Some(minecraft_arguments.clone());
+
+    // The game argument array takes precedence when launching, so a template declared by a
+    // patch must be applied to it as well, e.g. the launch arguments a modpack requires.
+    if let Some(arguments) = &mut client_info.arguments {
+      arguments.game.extend(
+        minecraft_arguments
+          .split_whitespace()
+          .map(|token| ArgumentsItem {
+            value: vec![token.to_string()],
+            ..Default::default()
+          }),
+      );
+    }
   }
 
   for patch in patch_refs {

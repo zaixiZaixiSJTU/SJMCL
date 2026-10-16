@@ -79,6 +79,7 @@ pub async fn select_suitable_jre(
       .java_version
       .as_ref()
       .map_or(0i32, |v| v.major_version),
+    &client_info.compatible_java_majors,
   )
   .await?;
 
