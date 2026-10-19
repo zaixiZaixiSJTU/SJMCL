@@ -431,11 +431,9 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
   client_info.extra_jvm_arguments.clear();
   client_info.compatible_java_majors.clear();
   for patch in &patches {
-    for argument in &patch.extra_jvm_arguments {
-      if !client_info.extra_jvm_arguments.contains(argument) {
-        client_info.extra_jvm_arguments.push(argument.clone());
-      }
-    }
+    client_info
+      .extra_jvm_arguments
+      .extend(patch.extra_jvm_arguments.iter().cloned());
     for major in &patch.compatible_java_majors {
       if !client_info.compatible_java_majors.contains(major) {
         client_info.compatible_java_majors.push(*major);

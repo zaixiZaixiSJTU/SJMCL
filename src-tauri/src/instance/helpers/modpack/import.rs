@@ -127,6 +127,8 @@ pub struct ModpackComponentPatch {
   /// The client jar declared by the patch, if any.
   pub main_jar: Option<LibrariesValue>,
   pub libraries: Vec<LibrariesValue>,
+  /// MultiMC `libraries` replaces the component's original library list.
+  pub replaces_libraries: bool,
   /// Files the component needs in the Maven directory but that are not part of the classpath,
   /// e.g. the installer jar a launch wrapper runs (MultiMC `mavenFiles`).
   pub maven_files: Vec<LibrariesValue>,
@@ -201,6 +203,22 @@ pub fn apply_launch_info_to_client_info(
   launch_info: &ModpackLaunchInfo,
 ) -> SJMCLResult<()> {
   let mut tweakers: Vec<String> = Vec::new();
+
+  // The net.minecraft component is the modpack's replacement for the vanilla game patch.
+  // Its `libraries` field replaces the vanilla library list; `+libraries` remains additive.
+  if let Some(component) = launch_info
+    .patches
+    .iter()
+    .find(|patch| patch.id == "net.minecraft" && patch.replaces_libraries)
+  {
+    if let Some(game_patch) = client_info
+      .patches
+      .iter_mut()
+      .find(|patch| patch.id == "game")
+    {
+      game_patch.libraries = component.libraries.clone();
+    }
+  }
 
   for patch in &launch_info.patches {
     let mut patch_info = McClientInfo {
