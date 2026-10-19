@@ -281,7 +281,8 @@ pub fn merge_library_lists(
   libraries_a: &[LibrariesValue],
   libraries_b: &[LibrariesValue],
 ) -> Vec<LibrariesValue> {
-  let mut library_map: HashMap<LibraryKey, LibrariesValue> = HashMap::new();
+  let mut library_indices: HashMap<LibraryKey, usize> = HashMap::new();
+  let mut libraries: Vec<LibrariesValue> = Vec::new();
 
   for library in libraries_a.iter().chain(libraries_b.iter()) {
     if let Ok(library_parts) = parse_library_name(&library.name, None) {
@@ -294,21 +295,22 @@ pub fn merge_library_lists(
 
       let new_version = library_parts.pack_version;
 
-      if let Some(existing_library) = library_map.get(&key) {
-        let existing_version = parse_library_name(&existing_library.name, None)
+      if let Some(&index) = library_indices.get(&key) {
+        let existing_version = parse_library_name(&libraries[index].name, None)
           .map(|parts| parts.pack_version)
           .unwrap_or("0.1.0".to_string());
 
         if parse_sem_version(&new_version) > parse_sem_version(&existing_version) {
-          library_map.insert(key, library.clone());
+          libraries[index] = library.clone();
         }
       } else {
-        library_map.insert(key, library.clone());
+        library_indices.insert(key, libraries.len());
+        libraries.push(library.clone());
       }
     }
   }
 
-  library_map.into_values().collect()
+  libraries
 }
 
 /// Insert a library into the library list of a client json, following Prism's
@@ -762,6 +764,27 @@ mod tests {
       name: name.to_string(),
       ..Default::default()
     }
+  }
+
+  #[test]
+  fn merge_library_lists_preserves_classpath_order() {
+    let merged = merge_library_lists(
+      &[
+        library("com.github.GTNewHorizons:lwjgl3ify:2.1.16:forgePatches"),
+        library("commons-io:commons-io:2.4"),
+      ],
+      &[library("commons-io:commons-io:2.5")],
+    );
+    assert_eq!(
+      merged
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect::<Vec<_>>(),
+      [
+        "com.github.GTNewHorizons:lwjgl3ify:2.1.16:forgePatches",
+        "commons-io:commons-io:2.5"
+      ]
+    );
   }
 
   #[test]
