@@ -664,6 +664,7 @@ fn convert_component_patch(
         .as_ref()
         .map(|library| convert_library(library).0),
       libraries,
+      replaces_libraries: patch.libraries.is_some(),
       maven_files,
       jvm_args: patch.addn_jvm_args.clone().unwrap_or_default(),
       tweakers: patch.add_tweakers.clone().unwrap_or_default(),
@@ -695,6 +696,19 @@ fn patch_id(component: &MultiMcComponent, is_cleanroom: bool) -> String {
 fn convert_library(library: &MultiMcLibrary) -> (LibrariesValue, Option<String>) {
   let relative_path = convert_library_name_to_path(&library.name, None).ok();
   let mut downloads = library.downloads.clone();
+
+  if let Some(classifiers) = downloads
+    .as_mut()
+    .and_then(|downloads| downloads.classifiers.as_mut())
+  {
+    for (classifier, artifact) in classifiers {
+      if artifact.path.is_empty()
+        && let Ok(path) = convert_library_name_to_path(&library.name, Some(classifier.clone()))
+      {
+        artifact.path = path;
+      }
+    }
+  }
 
   let declared_path = downloads
     .as_ref()
@@ -1180,6 +1194,128 @@ JvmArgs=-Dtest.arg=1\nOverrideMemory=true\nMinMemAlloc=2048\nMaxMemAlloc=8192\n"
       version: Some(version.to_string()),
       ..Default::default()
     }
+  }
+
+  #[test]
+  fn fills_missing_native_classifier_paths() {
+    let library: MultiMcLibrary = serde_json::from_str(
+      r#"{
+        "name": "org.lwjgl.lwjgl:lwjgl-platform:2.9.4-nightly-20150209",
+        "natives": { "windows": "natives-windows" },
+        "downloads": {
+          "classifiers": {
+            "natives-windows": {
+              "path": "",
+              "url": "https://libraries.minecraft.net/lwjgl-platform-natives-windows.jar",
+              "sha1": "abc",
+              "size": 613748
+            }
+          }
+        }
+      }"#,
+    )
+    .unwrap();
+
+    let (converted, _) = convert_library(&library);
+    let native = converted
+      .downloads
+      .as_ref()
+      .and_then(|downloads| downloads.classifiers.as_ref())
+      .and_then(|classifiers| classifiers.get("natives-windows"))
+      .unwrap();
+    assert_eq!(
+      native.path,
+      "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/lwjgl-platform-2.9.4-nightly-20150209-natives-windows.jar"
+    );
+    assert_eq!(native.sha1, "abc");
+  }
+
+  #[test]
+  fn preserves_repeated_jvm_options_with_separate_values() {
+    let mut client_info = McClientInfo {
+      patches: vec![McClientInfo {
+        id: "game".to_string(),
+        ..Default::default()
+      }],
+      ..Default::default()
+    };
+    let launch_info = ModpackLaunchInfo {
+      patches: vec![ModpackComponentPatch {
+        id: "lwjgl3ify".to_string(),
+        jvm_args: vec![
+          "--add-opens".to_string(),
+          "java.base/java.io=ALL-UNNAMED".to_string(),
+          "--add-opens".to_string(),
+          "java.base/java.lang.invoke=ALL-UNNAMED".to_string(),
+        ],
+        ..Default::default()
+      }],
+      ..Default::default()
+    };
+
+    apply_launch_info_to_client_info(&mut client_info, &launch_info).unwrap();
+    assert_eq!(
+      client_info.extra_jvm_arguments,
+      launch_info.patches[0].jvm_args
+    );
+  }
+
+  #[test]
+  fn minecraft_component_replaces_vanilla_libraries() {
+    let mut client_info = McClientInfo {
+      patches: vec![McClientInfo {
+        id: "game".to_string(),
+        libraries: vec![
+          LibrariesValue {
+            name: "org.lwjgl.lwjgl:lwjgl:2.9.1".to_string(),
+            ..Default::default()
+          },
+          LibrariesValue {
+            name: "org.lwjgl.lwjgl:lwjgl_util:2.9.1".to_string(),
+            ..Default::default()
+          },
+          LibrariesValue {
+            name: "com.google.guava:guava:17.0".to_string(),
+            ..Default::default()
+          },
+        ],
+        ..Default::default()
+      }],
+      ..Default::default()
+    };
+    let launch_info = ModpackLaunchInfo {
+      patches: vec![
+        ModpackComponentPatch {
+          id: "net.minecraft".to_string(),
+          libraries: vec![LibrariesValue {
+            name: "com.google.guava:guava:17.0".to_string(),
+            ..Default::default()
+          }],
+          replaces_libraries: true,
+          ..Default::default()
+        },
+        ModpackComponentPatch {
+          id: "org.lwjgl3".to_string(),
+          libraries: vec![LibrariesValue {
+            name: "org.lwjgl:lwjgl:3.3.3".to_string(),
+            ..Default::default()
+          }],
+          ..Default::default()
+        },
+      ],
+      ..Default::default()
+    };
+
+    apply_launch_info_to_client_info(&mut client_info, &launch_info).unwrap();
+    let names = client_info
+      .libraries
+      .iter()
+      .map(|library| library.name.as_str())
+      .collect::<Vec<_>>();
+    assert_eq!(
+      names,
+      ["com.google.guava:guava:17.0", "org.lwjgl:lwjgl:3.3.3"]
+    );
   }
 
   // The Java 8 GTNH packs ship only `mmc-pack.json` and `instance.cfg`: the game itself and
