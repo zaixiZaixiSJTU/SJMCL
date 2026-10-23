@@ -529,7 +529,16 @@ pub fn get_nonnative_library_paths(
   libraries = merge_library_lists(&libraries, &[]); // remove duplicates to prevent launch errors
   let mut result = Vec::new();
   for library in libraries {
-    result.push(library_path.join(convert_library_name_to_path(&library.name, None)?));
+    let path = library
+      .downloads
+      .as_ref()
+      .and_then(|downloads| downloads.artifact.as_ref())
+      .map(|artifact| artifact.path.as_str())
+      .filter(|path| !path.is_empty());
+    result.push(library_path.join(match path {
+      Some(path) => path.to_string(),
+      None => convert_library_name_to_path(&library.name, None)?,
+    }));
   }
   Ok(result)
 }
