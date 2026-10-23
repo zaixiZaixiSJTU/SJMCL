@@ -542,11 +542,7 @@ pub fn get_nonnative_library_paths(
   libraries = merge_library_lists(&libraries, &[]); // remove duplicates to prevent launch errors
   let mut result = Vec::new();
   for library in libraries {
-    let path = if mod_loader_type == ModLoaderType::Cleanroom {
-      get_library_artifact_path(&library)?
-    } else {
-      convert_library_name_to_path(&library.name, None)?
-    };
+    let path = get_library_artifact_path(&library)?;
     result.push(library_path.join(path));
   }
   Ok(result)
