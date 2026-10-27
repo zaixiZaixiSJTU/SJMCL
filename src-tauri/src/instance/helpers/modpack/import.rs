@@ -9,7 +9,7 @@ use zip::ZipArchive;
 
 use crate::download::DownloadTask;
 use crate::instance::helpers::client_json::{
-  ArgumentsItem, DownloadsValue, LibrariesValue, McClientInfo, reset_fields_from_patches,
+  DownloadsValue, LibrariesValue, McClientInfo, reset_fields_from_patches,
 };
 use crate::instance::helpers::modpack::curseforge::CurseForgeManifest;
 use crate::instance::helpers::modpack::modrinth::ModrinthManifest;
@@ -17,6 +17,7 @@ use crate::instance::helpers::modpack::multimc::MultiMcManifest;
 use crate::instance::models::misc::{InstanceError, ModLoader, ModLoaderType};
 use crate::resource::commands::fetch_mod_loader_version_list;
 use crate::resource::models::OtherResourceSource;
+use crate::utils::fs::normalize_relative_path;
 
 #[async_trait]
 pub trait ModpackManifest {
@@ -181,7 +182,7 @@ pub fn extract_local_libraries(
   let mut archive = ZipArchive::new(file)?;
   for (source, destination) in local_libraries {
     let mut archive_file = archive.by_name(source)?;
-    let outpath = libraries_dir.join(destination);
+    let outpath = libraries_dir.join(normalize_relative_path(Path::new(destination))?);
 
     if let Some(p) = outpath.parent()
       && !p.exists()
@@ -202,8 +203,6 @@ pub fn apply_launch_info_to_client_info(
   client_info: &mut McClientInfo,
   launch_info: &ModpackLaunchInfo,
 ) -> SJMCLResult<()> {
-  let mut tweakers: Vec<String> = Vec::new();
-
   // The net.minecraft component is the modpack's replacement for the vanilla game patch.
   // Its `libraries` field replaces the vanilla library list; `+libraries` remains additive.
   if let Some(component) = launch_info
@@ -230,6 +229,7 @@ pub fn apply_launch_info_to_client_info(
       libraries: patch.libraries.clone(),
       maven_files: patch.maven_files.clone(),
       extra_jvm_arguments: patch.jvm_args.clone(),
+      tweakers: patch.tweakers.clone(),
       compatible_java_majors: patch.compatible_java_majors.clone(),
       ..Default::default()
     };
@@ -275,50 +275,12 @@ pub fn apply_launch_info_to_client_info(
         .push("-XstartOnFirstThread".to_string());
     }
 
-    // If several patches declare the same tweaker, keep only the last declaration,
-    // matching MultiMC's tweaker ordering.
-    for tweaker in &patch.tweakers {
-      if let Some(index) = tweakers.iter().position(|item| item == tweaker) {
-        tweakers.remove(index);
-      }
-      tweakers.push(tweaker.clone());
-    }
-
     client_info.patches.push(patch_info);
   }
 
   reset_fields_from_patches(client_info);
 
-  // Tweakers are appended to the merged game arguments, no matter which patch declared the
-  // arguments themselves.
-  if !tweakers.is_empty() {
-    append_tweakers(client_info, &tweakers);
-  }
-
   Ok(())
-}
-
-/// Append `--tweakClass` arguments to the game arguments of the merged client info.
-fn append_tweakers(client_info: &mut McClientInfo, tweakers: &[String]) {
-  if let Some(arguments) = &mut client_info.arguments {
-    for tweaker in tweakers {
-      arguments.game.push(ArgumentsItem {
-        value: vec!["--tweakClass".to_string(), tweaker.clone()],
-        ..Default::default()
-      });
-    }
-    return;
-  }
-
-  let mut arguments = client_info.minecraft_arguments.take().unwrap_or_default();
-  for tweaker in tweakers {
-    if !arguments.is_empty() && !arguments.ends_with(' ') {
-      arguments.push(' ');
-    }
-    arguments.push_str("--tweakClass ");
-    arguments.push_str(tweaker);
-  }
-  client_info.minecraft_arguments = Some(arguments);
 }
 
 pub async fn get_download_params(

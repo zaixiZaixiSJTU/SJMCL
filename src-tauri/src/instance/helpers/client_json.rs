@@ -50,6 +50,9 @@ pub struct McClientInfo {
   // Additional JVM arguments required by a patch, e.g. MultiMC `+jvmArgs`.
   #[serde(skip_serializing_if = "Vec::is_empty", default)]
   pub extra_jvm_arguments: Vec<String>,
+  // Keep component tweakers so rebuilding launch arguments preserves them.
+  #[serde(skip_serializing_if = "Vec::is_empty", default)]
+  pub tweakers: Vec<String>,
   // The exact set of Java major versions this instance may run on, e.g. Prism's
   // `compatibleJavaMajors`. Empty means the version is not constrained.
   #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -473,7 +476,14 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
     }
   }
 
+  let mut tweakers = Vec::new();
   for patch in patch_refs {
+    // Keep the last declaration in component priority order.
+    for tweaker in &patch.tweakers {
+      tweakers.retain(|item| item != tweaker);
+      tweakers.push(tweaker.clone());
+    }
+
     if let Some(main_class) = &patch.main_class {
       client_info.main_class = Some(main_class.clone());
     }
@@ -523,6 +533,32 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
       }
     }
   }
+  if !tweakers.is_empty() {
+    append_tweakers(client_info, &tweakers);
+  }
+}
+
+/// Append `--tweakClass` arguments to the game arguments of the merged client info.
+fn append_tweakers(client_info: &mut McClientInfo, tweakers: &[String]) {
+  if let Some(arguments) = &mut client_info.arguments {
+    for tweaker in tweakers {
+      arguments.game.push(ArgumentsItem {
+        value: vec!["--tweakClass".to_string(), tweaker.clone()],
+        ..Default::default()
+      });
+    }
+    return;
+  }
+
+  let mut arguments = client_info.minecraft_arguments.take().unwrap_or_default();
+  for tweaker in tweakers {
+    if !arguments.is_empty() && !arguments.ends_with(' ') {
+      arguments.push(' ');
+    }
+    arguments.push_str("--tweakClass ");
+    arguments.push_str(tweaker);
+  }
+  client_info.minecraft_arguments = Some(arguments);
 }
 
 fn normalize_optifine_tweaker(arguments: &mut LaunchArgumentTemplate, has_forge_patch: bool) {
