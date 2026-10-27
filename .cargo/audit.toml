@@ -2,4 +2,8 @@
 ignore = [
   # RSA is used for local signing and JWT verification; no decryption. No upstream fix is available yet.
   "RUSTSEC-2023-0071",
+  # crypto-bigint is only reachable via p256/p384, which jsonwebtoken pulls in for its rust_crypto
+  # feature; SJMCL only verifies RS256 tokens. Fixed in crypto-bigint 0.7.6, but jsonwebtoken still
+  # pins p256/p384 0.13 (elliptic-curve 0.13 -> crypto-bigint 0.5), so there is no upgrade path yet.
+  "RUSTSEC-2026-0387",
 ]
