@@ -33,9 +33,7 @@ pub trait ModpackManifest {
     instance_path: &Path,
   ) -> SJMCLResult<Vec<DownloadTask>>;
   fn get_overrides_path(&self) -> String;
-  /// Launch related information declared by the modpack itself, which cannot be
-  /// represented by the regular installation pipeline,
-  /// e.g. MultiMC/Prism component patches (`patches/*.json`).
+  /// Launch overrides from the modpack's component patches.
   async fn get_launch_info(&self, _app: &AppHandle) -> SJMCLResult<ModpackLaunchInfo> {
     Ok(ModpackLaunchInfo::default())
   }
@@ -113,25 +111,21 @@ pub struct ModpackAgent {
   pub argument: Option<String>,
 }
 
-/// A launch configuration declared by a component patch inside the modpack archive,
-/// e.g. MultiMC/Prism `patches/<uid>.json`.
+/// Launch settings from a MultiMC/Prism component patch.
 #[derive(Debug, Clone, Default)]
 pub struct ModpackComponentPatch {
-  /// Client json patch id: the mod loader id for mod loader components, the component uid
-  /// otherwise.
+  /// Mod loader id for loader components; component uid otherwise.
   pub id: String,
   pub version: Option<String>,
   /// Application order of the patch, ascending.
   pub priority: i64,
   pub main_class: Option<String>,
   pub minecraft_arguments: Option<String>,
-  /// The client jar declared by the patch, if any.
   pub main_jar: Option<LibrariesValue>,
   pub libraries: Vec<LibrariesValue>,
   /// MultiMC `libraries` replaces the component's original library list.
   pub replaces_libraries: bool,
-  /// Files the component needs in the Maven directory but that are not part of the classpath,
-  /// e.g. the installer jar a launch wrapper runs (MultiMC `mavenFiles`).
+  /// Required Maven files excluded from the classpath.
   pub maven_files: Vec<LibrariesValue>,
   pub jvm_args: Vec<String>,
   pub tweakers: Vec<String>,
@@ -141,16 +135,12 @@ pub struct ModpackComponentPatch {
   pub compatible_java_majors: Vec<i32>,
 }
 
-/// Launch related information declared by the modpack archive itself, which the regular
-/// installation pipeline cannot represent.
 #[derive(Debug, Clone, Default)]
 pub struct ModpackLaunchInfo {
   pub patches: Vec<ModpackComponentPatch>,
-  /// The modpack defines its mod loader completely, so installing the regular mod loader
-  /// must be skipped to avoid overwriting it.
+  /// Skip regular loader installation when the pack supplies a complete loader.
   pub is_mod_loader_provided: bool,
-  /// Library files shipped inside the archive: (path in archive, path relative to the
-  /// libraries directory).
+  /// (Archive path, destination relative to the libraries directory).
   pub local_libraries: Vec<(String, String)>,
   /// JVM arguments required by the modpack (`instance.cfg` `JvmArgs`).
   pub jvm_args: Option<String>,
@@ -197,14 +187,11 @@ pub fn extract_local_libraries(
   Ok(())
 }
 
-/// Convert the launch information declared by a modpack into client json patches,
-/// so that it takes part in the regular client json merging and downloading.
 pub fn apply_launch_info_to_client_info(
   client_info: &mut McClientInfo,
   launch_info: &ModpackLaunchInfo,
 ) -> SJMCLResult<()> {
-  // The net.minecraft component is the modpack's replacement for the vanilla game patch.
-  // Its `libraries` field replaces the vanilla library list; `+libraries` remains additive.
+  // net.minecraft `libraries` replaces vanilla libraries; `+libraries` remains additive.
   if let Some(component) = launch_info
     .patches
     .iter()
@@ -234,8 +221,7 @@ pub fn apply_launch_info_to_client_info(
       ..Default::default()
     };
 
-    // The client jar declared by the modpack replaces the vanilla one. Jars without a
-    // download cannot be fetched and are ignored.
+    // Replace the vanilla client jar only when the component provides a download URL.
     if let Some(artifact) = patch
       .main_jar
       .as_ref()
@@ -262,8 +248,6 @@ pub fn apply_launch_info_to_client_info(
       patch_info.extra_jvm_arguments.push(argument);
     }
 
-    // Only the macOS first thread trait affects the launch command, and only on macOS
-    // (ref: MultiMC MinecraftInstance::javaArguments).
     if cfg!(target_os = "macos")
       && patch
         .traits
