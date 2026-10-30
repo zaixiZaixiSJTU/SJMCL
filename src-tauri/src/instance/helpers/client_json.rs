@@ -401,9 +401,9 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
   // Libraries apply in patch order: a patch may declare a higher version of a library that an
   // earlier patch already applied, e.g. the LWJGL version an old modpack ships as a component.
   client_info.libraries.clear();
-  let mut component_patches = patches.iter().skip(1).collect::<Vec<_>>();
-  component_patches.sort_by_key(|patch| patch.priority.unwrap_or(i64::MIN));
-  for patch in component_patches {
+  let mut patch_refs = patches.iter().skip(1).collect::<Vec<_>>();
+  patch_refs.sort_by_key(|patch| patch.priority.unwrap_or(i64::MIN));
+  for patch in &patch_refs {
     for library in &patch.libraries {
       apply_library(&mut client_info.libraries, library.clone());
     }
@@ -448,9 +448,6 @@ pub fn reset_fields_from_patches(client_info: &mut McClientInfo) {
   client_info.main_class = base.main_class.clone();
   client_info.arguments = base.arguments.clone();
   client_info.minecraft_arguments = base.minecraft_arguments.clone();
-
-  let mut patch_refs = patches.iter().skip(1).collect::<Vec<_>>();
-  patch_refs.sort_by_key(|patch| patch.priority.unwrap_or(i64::MIN));
 
   // Non-OptiFine `minecraftArguments` replace the inherited template; OptiFine arguments are incremental (ref: #1897).
   if let Some(minecraft_arguments) = patch_refs

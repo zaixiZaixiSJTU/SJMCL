@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use config::Config;
 use serde::{Deserialize, Serialize};
 use sjmcl_types::error::SJMCLResult;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
@@ -32,9 +32,7 @@ const MOD_LOADER_COMPONENT_UIDS: [&str; 4] = [
   "org.quiltmc.quilt-loader",
 ];
 
-/// Component meta server, used to resolve the components that are not shipped with the modpack.
-/// Prism's meta is the maintained one and extends the MultiMC format with the Java version
-/// declarations (`compatibleJavaMajors`/`compatibleJavaName`) that older packs rely on.
+/// Resolve missing components using Prism metadata, including Java compatibility constraints.
 const COMPONENT_META_URL: &str = "https://meta.prismlauncher.org/v1";
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -42,6 +40,7 @@ const COMPONENT_META_URL: &str = "https://meta.prismlauncher.org/v1";
 pub struct MultiMcCacheRequires {
   pub uid: String,
   pub equals: Option<String>,
+  pub suggests: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
@@ -97,8 +96,7 @@ pub struct MultiMcPatch {
   pub file_id: Option<String>,
   pub name: Option<String>,
   pub version: Option<String>,
-  /// Application order of the component: components are applied in ascending order (MultiMC
-  /// `order`), which may differ from the order in `mmc-pack.json`.
+  /// Ascending application order, overriding the position in `mmc-pack.json`.
   pub order: Option<i64>,
   pub main_class: Option<String>,
   pub minecraft_arguments: Option<String>,
@@ -114,13 +112,12 @@ pub struct MultiMcPatch {
   #[serde(rename = "+libraries")]
   pub addn_libraries: Option<Vec<MultiMcLibrary>>,
   pub libraries: Option<Vec<MultiMcLibrary>>,
-  /// Files the component needs in the Maven directory but that are not part of the classpath,
-  /// e.g. the installer jar a launch wrapper (ForgeWrapper) runs.
+  /// Required Maven files excluded from the classpath.
   pub maven_files: Option<Vec<MultiMcLibrary>>,
-  /// The client jar of the component.
   pub main_jar: Option<MultiMcLibrary>,
   /// Prism extension: the exact set of Java major versions this component supports.
   pub compatible_java_majors: Option<Vec<i32>>,
+  pub requires: Option<Vec<MultiMcCacheRequires>>,
 }
 
 structstruck::strike! {
@@ -191,6 +188,7 @@ impl ModpackManifest for MultiMcManifest {
     manifest.base_path = base_path;
     manifest.cfg = config.try_deserialize::<HashMap<String, String>>()?;
     manifest.patches = read_patches(&mut archive, &manifest.base_path)?;
+    expand_local_requirements(&mut manifest);
     let launch_info = build_launch_info(&mut archive, &manifest)?;
     manifest.launch_info = launch_info;
 
@@ -206,8 +204,7 @@ impl ModpackManifest for MultiMcManifest {
         ..Default::default()
       };
       if self.launch_info.is_mod_loader_provided {
-        // The modpack ships the complete definition of its mod loader itself, so the loader
-        // version does not need to be present in SJMCL's mod loader version list.
+        // Complete bundled loaders need not appear in SJMCL's loader version list.
         Some(mod_loader)
       } else {
         Some(mod_loader.with_branch(app, client_version.clone()).await?)
@@ -243,8 +240,7 @@ impl ModpackManifest for MultiMcManifest {
       }
       match component.uid.as_str() {
         "net.minecraft" => continue,
-        // Cleanroom packs keep the Forge component uid, but replace its startup entry point
-        // and libraries, so they must not be treated as regular Forge.
+        // Cleanroom reuses the Forge uid with its own entry point and libraries.
         "net.minecraftforge" => {
           let loader_type = if self.is_cleanroom_component(component) {
             ModLoaderType::Cleanroom
@@ -279,15 +275,27 @@ impl ModpackManifest for MultiMcManifest {
   async fn get_launch_info(&self, app: &AppHandle) -> SJMCLResult<ModpackLaunchInfo> {
     let mut launch_info = self.launch_info.clone();
 
-    // Components without a patch inside the archive are resolved from the component meta
-    // server, like MultiMC and Prism do themselves. Components that only override the game
-    // itself take part too, since they declare the Java versions the pack supports.
+    // Resolve missing patches, including game components that constrain Java versions.
     let client = app.state::<reqwest::Client>();
-    for (index, component) in self.components.iter().enumerate() {
-      if component.disabled.unwrap_or(false) || self.patches.contains_key(&component.uid) {
+    let mut pending: VecDeque<_> = self.components.iter().cloned().collect();
+    let mut known: HashSet<_> = self
+      .components
+      .iter()
+      .map(|component| component.uid.clone())
+      .collect();
+    let mut processed = HashSet::new();
+    let mut index = 0;
+    while let Some(component) = pending.pop_front() {
+      if component.disabled.unwrap_or(false) || !processed.insert(component.uid.clone()) {
         continue;
       }
-      let Ok(version) = get_version(component) else {
+      let order_index = index;
+      index += 1;
+      if let Some(patch) = self.patches.get(&component.uid) {
+        enqueue_requirements(patch, &mut known, &mut pending);
+        continue;
+      }
+      let Ok(version) = get_version(&component) else {
         continue;
       };
 
@@ -304,13 +312,55 @@ impl ModpackManifest for MultiMcManifest {
       };
 
       // Metadata components cannot ship local libraries, so every library must be downloadable.
-      let order = patch.order.unwrap_or(index as i64);
+      enqueue_requirements(&patch, &mut known, &mut pending);
+      let order = patch.order.unwrap_or(order_index as i64);
       let mut find_local = |_relative_path: &str| None;
-      let converted = convert_component_patch(component, &patch, order, false, &mut find_local);
+      let converted = convert_component_patch(&component, &patch, order, false, &mut find_local);
       accept_component_patch(&mut launch_info, &component.uid, converted);
     }
 
     Ok(launch_info)
+  }
+}
+
+fn enqueue_requirements(
+  patch: &MultiMcPatch,
+  known: &mut HashSet<String>,
+  pending: &mut VecDeque<MultiMcComponent>,
+) {
+  for requirement in patch.requires.iter().flatten() {
+    if known.insert(requirement.uid.clone()) {
+      pending.push_back(MultiMcComponent {
+        uid: requirement.uid.clone(),
+        version: requirement
+          .equals
+          .clone()
+          .or_else(|| requirement.suggests.clone()),
+        ..Default::default()
+      });
+    }
+  }
+}
+
+fn expand_local_requirements(manifest: &mut MultiMcManifest) {
+  let mut known: HashSet<_> = manifest
+    .components
+    .iter()
+    .map(|component| component.uid.clone())
+    .collect();
+  let mut pending = VecDeque::new();
+  for component in &manifest.components {
+    if !component.disabled.unwrap_or(false)
+      && let Some(patch) = manifest.patches.get(&component.uid)
+    {
+      enqueue_requirements(patch, &mut known, &mut pending);
+    }
+  }
+  while let Some(component) = pending.pop_front() {
+    if let Some(patch) = manifest.patches.get(&component.uid) {
+      enqueue_requirements(patch, &mut known, &mut pending);
+    }
+    manifest.components.push(component);
   }
 }
 
@@ -420,7 +470,6 @@ impl MultiMcManifest {
   }
 }
 
-/// Read all component patches (`patches/<uid>.json`) stored in the archive.
 fn read_patches<R: Read + Seek>(
   archive: &mut ZipArchive<R>,
   base_path: &str,
@@ -455,8 +504,7 @@ fn read_patches<R: Read + Seek>(
   Ok(patches)
 }
 
-/// Build the launch information declared by the patches shipped inside the modpack archive.
-/// Only the components listed in `mmc-pack.json` are applied, following the order of that list.
+/// Apply enabled manifest components; explicit patch order overrides manifest order.
 fn build_launch_info<R: Read + Seek>(
   archive: &mut ZipArchive<R>,
   manifest: &MultiMcManifest,
@@ -497,9 +545,7 @@ fn build_launch_info<R: Read + Seek>(
   Ok(launch_info)
 }
 
-/// Keep a converted component in the launch information. A mod loader component is only kept
-/// when it defines the mod loader completely, so that a partial definition does not hide the
-/// regular mod loader installation of SJMCL.
+/// Incomplete loader patches must fall back to regular loader installation.
 fn accept_component_patch(
   launch_info: &mut ModpackLaunchInfo,
   uid: &str,
@@ -507,8 +553,6 @@ fn accept_component_patch(
 ) {
   if MOD_LOADER_COMPONENT_UIDS.contains(&uid) {
     if converted.patch.libraries.is_empty() || !converted.is_complete {
-      // The component does not define the mod loader completely, so the regular mod
-      // loader installation is kept instead of applying a partial definition.
       log::warn!(
         "Modpack component {} is incomplete, falling back to the regular mod loader installation",
         uid
@@ -524,26 +568,20 @@ fn accept_component_patch(
     .extend(converted.local_libraries);
 }
 
-/// One component patch converted into client json form.
 struct ConvertedComponentPatch {
   patch: ModpackComponentPatch,
-  /// Library files shipped inside the archive: (path in archive, path relative to the
-  /// libraries directory).
+  /// (Archive path, destination relative to the libraries directory).
   local_libraries: Vec<(String, String)>,
   /// Whether every library declared by the patch can be obtained.
   is_complete: bool,
 }
 
-/// Application priority of a component patch. Every patch is applied after the base game patch,
-/// and patches follow the application order declared by their component (`order`, falling back
-/// to the position of the component in `mmc-pack.json`).
+/// Keep component priorities above the base game patch's priority of zero.
 fn component_priority(order: i64) -> i64 {
   1000i64.saturating_add(order.max(-999))
 }
 
-/// Resolve one library declared by a component patch. Returns the library and its path
-/// relative to the libraries directory when it can be obtained; libraries shipped inside the
-/// archive are recorded in `local_libraries`.
+/// Resolve downloadable or bundled libraries and record local extraction paths.
 fn resolve_library(
   library: &MultiMcLibrary,
   uid: &str,
@@ -572,14 +610,12 @@ fn resolve_library(
     && let Some(relative_path) = relative_path.as_deref()
     && let Some(source) = find_local(&library_source_path(library, relative_path))
   {
-    // Libraries without a download, or marked `local`, are shipped with the modpack.
     local_libraries.push((source, relative_path.to_string()));
     resolvable = true;
   }
 
   if !resolvable {
-    // The library cannot be obtained. Keep the rest of the definition instead of failing
-    // the whole import; if it belongs to a mod loader, the regular installation handles it.
+    // Missing libraries make loader components fall back to regular installation.
     log::warn!(
       "Skipping unavailable library {} of modpack component {}",
       library.name,
@@ -591,9 +627,7 @@ fn resolve_library(
   Some((library_value, relative_path))
 }
 
-/// Convert one component patch into a client json patch.
-/// `find_local` returns the path inside the archive of a library shipped with the modpack.
-/// `order` is the application order of the component, see `component_priority`.
+/// `find_local` maps library paths to entries in the archive.
 fn convert_component_patch(
   component: &MultiMcComponent,
   patch: &MultiMcPatch,
@@ -639,7 +673,6 @@ fn convert_component_patch(
     }
   }
 
-  // Files that must be present in the Maven directory but that are not part of the classpath.
   for library in patch.maven_files.iter().flatten() {
     let Some((library_value, _)) =
       resolve_library(library, &component.uid, find_local, &mut local_libraries)
@@ -677,8 +710,7 @@ fn convert_component_patch(
   }
 }
 
-/// Client json patch id of a component. Mod loader components use the id of the corresponding
-/// mod loader, so that the regular mod loader handling keeps working on imported instances.
+/// Map loader component uids to SJMCL's loader patch ids.
 fn patch_id(component: &MultiMcComponent, is_cleanroom: bool) -> String {
   let id = match component.uid.as_str() {
     "net.minecraftforge" if is_cleanroom => "cleanroom",
@@ -691,8 +723,7 @@ fn patch_id(component: &MultiMcComponent, is_cleanroom: bool) -> String {
   id.to_string()
 }
 
-/// Convert a MultiMC library entry into an SJMCL one, and return its path relative to the
-/// libraries directory when it can be derived from the library name.
+/// Return the converted library and its Maven path, when derivable.
 fn convert_library(library: &MultiMcLibrary) -> (LibrariesValue, Option<String>) {
   let relative_path = convert_library_name_to_path(&library.name, None).ok();
   let mut downloads = library.downloads.clone();
@@ -710,24 +741,19 @@ fn convert_library(library: &MultiMcLibrary) -> (LibrariesValue, Option<String>)
     }
   }
 
-  let declared_path = downloads
+  let artifact = downloads
     .as_ref()
-    .and_then(|downloads| downloads.artifact.as_ref())
+    .and_then(|downloads| downloads.artifact.as_ref());
+  let declared_path = artifact
     .map(|artifact| artifact.path.clone())
     .filter(|path| !path.is_empty());
-  let declared_sha1 = downloads
-    .as_ref()
-    .and_then(|downloads| downloads.artifact.as_ref())
+  let declared_sha1 = artifact
     .map(|artifact| artifact.sha1.clone())
     .filter(|sha1| !sha1.is_empty());
-  let declared_size = downloads
-    .as_ref()
-    .and_then(|downloads| downloads.artifact.as_ref())
+  let declared_size = artifact
     .map(|artifact| artifact.size)
     .filter(|size| *size > 0);
-  let declared_url = downloads
-    .as_ref()
-    .and_then(|downloads| downloads.artifact.as_ref())
+  let declared_url = artifact
     .map(|artifact| artifact.url.clone())
     .filter(|url| !url.is_empty())
     .or_else(|| library.absolute_url.clone().filter(|url| !url.is_empty()));
@@ -769,8 +795,7 @@ fn convert_library(library: &MultiMcLibrary) -> (LibrariesValue, Option<String>)
   )
 }
 
-/// Path of a library inside the modpack archive: `MMC-filename` replaces the file name
-/// derived from the library name.
+/// `MMC-filename` overrides the Maven-derived file name inside the archive.
 fn library_source_path(library: &MultiMcLibrary, relative_path: &str) -> String {
   let Some(filename) = library.filename.as_ref().filter(|name| !name.is_empty()) else {
     return relative_path.to_string();
@@ -792,8 +817,7 @@ fn find_library_in_archive<R: Read + Seek>(
     if archive.by_name(&path).is_ok() {
       return Some(path);
     }
-    // MultiMC also stores local libraries directly in libraries/ while their
-    // classpath destination still follows the Maven layout.
+    // Flat archive libraries still use Maven paths at their destination.
     if let Some(filename) = relative_path.rsplit('/').next() {
       let path = format!("{}{}", prefix, filename);
       if archive.by_name(&path).is_ok() {
@@ -804,8 +828,6 @@ fn find_library_in_archive<R: Read + Seek>(
   None
 }
 
-/// Fetch the metadata of a component from the MultiMC meta server, in the same version file
-/// format as the patches shipped inside the modpack archive.
 async fn fetch_component_patch(
   client: &reqwest::Client,
   uid: &str,
